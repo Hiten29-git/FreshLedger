@@ -13,7 +13,12 @@ import {
   XCircle,
 } from 'lucide-react';
 import { formatCurrency } from '../lib/currency';
-import { classifyExpiryStatus, formatShortDate, getDaysUntilExpiry } from '../lib/dateUtils';
+import {
+  classifyExpiryStatus,
+  formatShortDate,
+  getDaysUntilExpiry,
+  getLiveExpiryCountdown,
+} from '../lib/dateUtils';
 import { CATEGORIES, STORAGE_LOCATIONS, type FoodItem, type WasteLog } from '../types';
 
 type InventoryTab = 'active' | 'expiring' | 'expired' | 'resolved';
@@ -23,6 +28,7 @@ interface InventoryViewProps {
   wasteLogs: WasteLog[];
   loading: boolean;
   currencyCode: string;
+  nowMs?: number;
   onAddItem: () => void;
   onEditItem: (item: FoodItem) => void;
   onConsumeItem: (item: FoodItem) => Promise<void>;
@@ -36,6 +42,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   wasteLogs,
   loading,
   currencyCode,
+  nowMs = Date.now(),
   onAddItem,
   onEditItem,
   onConsumeItem,
@@ -394,8 +401,9 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               </thead>
               <tbody className="divide-y divide-slate-200 text-sm">
                 {filteredItems.map((item) => {
-                  const daysLeft = getDaysUntilExpiry(item.expiresAt);
+                  const daysLeft = getDaysUntilExpiry(item.expiresAt, new Date(nowMs));
                   const statusMeta = classifyExpiryStatus(daysLeft);
+                  const liveCountdown = getLiveExpiryCountdown(item.expiresAt, nowMs);
                   const isBusy = busyId === item.id;
 
                   return (
@@ -429,7 +437,20 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                       </td>
 
                       <td className="py-3 px-4 font-mono tabular-nums text-xs text-slate-700 whitespace-nowrap">
-                        {formatShortDate(item.expiresAt)}
+                        <div>{formatShortDate(item.expiresAt)}</div>
+                        {item.status === 'active' && (
+                          <div
+                            className={`text-[11px] mt-0.5 ${
+                              liveCountdown.isExpired
+                                ? 'text-red-700'
+                                : liveCountdown.isToday
+                                  ? 'text-red-600 font-medium'
+                                  : 'text-slate-500'
+                            }`}
+                          >
+                            {liveCountdown.formatted}
+                          </div>
+                        )}
                       </td>
 
                       <td className="py-3 px-4 whitespace-nowrap">

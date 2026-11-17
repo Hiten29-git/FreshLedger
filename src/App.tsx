@@ -16,7 +16,9 @@ import { AnalyticsView } from './components/AnalyticsView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { InventoryView } from './components/InventoryView';
 import { ItemModal } from './components/ItemModal';
+import { LiveAlertToasts } from './components/LiveAlertToasts';
 import { NotificationsView } from './components/NotificationsView';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAControls';
 import { RulesView } from './components/RulesView';
 import { SignInView } from './components/SignInView';
 import { WasteOutcomeModal } from './components/WasteOutcomeModal';
@@ -25,7 +27,10 @@ import { getLocalDateString } from './lib/dateUtils';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from './lib/firebase';
 import {
   canUseBrowserNotifications,
+  dispatchBrowserNotification,
   evaluateAndDispatchNotifications,
+  playAlertChime,
+  type TriggeredAlertPreview,
 } from './lib/notificationEngine';
 import {
   addFoodItem,
@@ -90,6 +95,16 @@ function WorkspaceApp() {
   const [scanning, setScanning] = useState(false);
   const [lastScanAt, setLastScanAt] = useState<Date | null>(null);
   const [alertBanner, setAlertBanner] = useState<string | null>(null);
+  const [hasPendingSync, setHasPendingSync] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [liveToasts, setLiveToasts] = useState<TriggeredAlertPreview[]>([]);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('freshledger_sound_alerts') !== 'false';
+    } catch {
+      return true;
+    }
+  });
 
   const scanInFlightRef = useRef(false);
   const lastSignatureRef = useRef<string>('');
@@ -147,8 +162,10 @@ function WorkspaceApp() {
     const itemsPath = `users/${uid}/items`;
     const unsubItems = onSnapshot(
       query(collection(db, itemsPath), where('ownerId', '==', uid)),
+      { includeMetadataChanges: true },
       (snap) => {
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() } as FoodItem)));
+        setHasPendingSync(snap.metadata.hasPendingWrites);
         setItemsLoaded(true);
         setDataLoading(false);
       },
@@ -222,8 +239,18 @@ function WorkspaceApp() {
           setAlertBanner(
             result.triggeredCount === 1
               ? `Automated alert sent: ${preview}`
-              : `${result.triggeredCount} automated expiry alerts triggered (including ${preview})`
+              : `${result.triggeredCount} automated alerts triggered (including ${preview})`
           );
+          if (result.triggeredAlerts.length > 0) {
+            setLiveToasts((prev) => {
+              const seen = new Set(prev.map((t) => t.id));
+              const next = result.triggeredAlerts.filter((t) => !seen.has(t.id));
+              return [...next, ...prev].slice(0, 6);
+            });
+            if (soundEnabled) {
+              playAlertChime(result.triggeredAlerts[0].severity);
+            }
+          }
         } else if (manual) {
           setAlertBanner('Expiry scan complete — all active items are within configured alert thresholds.');
         }
@@ -232,7 +259,7 @@ function WorkspaceApp() {
         if (manual) setScanning(false);
       }
     },
-    [user, itemsLoaded, rulesLoaded, notifsLoaded, items, rules, notifications, profile, currencyCode]
+    [user, itemsLoaded, rulesLoaded, notifsLoaded, items, rules, notifications, profile, currencyCode, soundEnabled]
   );
 
   // Automatic scan when active items, enabled rules, or local calendar date change
@@ -264,19 +291,99 @@ function WorkspaceApp() {
     void runExpiryScan(false);
   }, [user, itemsLoaded, rulesLoaded, notifsLoaded, scanSignature, runExpiryScan]);
 
-  // Background 60-second timer to catch midnight/date rollovers automatically
+  // Real-time 1-second clock for live ticking expiry countdowns
+  useEffect(() => {
+    if (!user) return;
+    const tick = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(tick);
+  }, [user]);
+
+  // Real-time 10-second background scan + focus/visibility wakeup
   useEffect(() => {
     if (!user || !itemsLoaded || !rulesLoaded || !notifsLoaded) return;
     const interval = window.setInterval(() => {
       void runExpiryScan(false);
-    }, 60_000);
-    return () => window.clearInterval(interval);
+    }, 10_000);
+    const handleWake = () => {
+      if (document.visibilityState === 'visible') {
+        setNowMs(Date.now());
+        void runExpiryScan(false);
+      }
+    };
+    window.addEventListener('focus', handleWake);
+    document.addEventListener('visibilitychange', handleWake);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', handleWake);
+      document.removeEventListener('visibilitychange', handleWake);
+    };
   }, [user, itemsLoaded, rulesLoaded, notifsLoaded, runExpiryScan]);
 
   const unreadCount = useMemo(
     () => notifications.filter((n) => !n.read && !n.dismissed).length,
     [notifications]
   );
+
+  // Sync browser tab title with live unread alert count
+  useEffect(() => {
+    const baseTitle = 'FreshLedger — Food Expiry & Waste Tracking';
+    document.title = user && unreadCount > 0 ? `(${unreadCount}) ${baseTitle}` : baseTitle;
+  }, [user, unreadCount]);
+
+  const itemsById = useMemo(() => {
+    const map = new Map<string, FoodItem>();
+    for (const item of items) {
+      map.set(item.id, item);
+    }
+    return map;
+  }, [items]);
+
+  const handleToggleSound = () => {
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('freshledger_sound_alerts', String(next));
+      } catch {
+        // ignore storage errors
+      }
+      if (next) {
+        playAlertChime('warning');
+      }
+      return next;
+    });
+  };
+
+  const handleTriggerTestAlert = () => {
+    const activeExpiring = items.find((i) => i.status === 'active');
+    const previewAlert: TriggeredAlertPreview = {
+      id: `test-${Date.now()}`,
+      itemId: activeExpiring?.id ?? 'test-item',
+      itemName: activeExpiring?.name ?? 'Organic Baby Spinach',
+      title: activeExpiring
+        ? `${activeExpiring.name} — Live Expiry Check`
+        : 'Organic Baby Spinach expires soon',
+      message: activeExpiring
+        ? `${activeExpiring.quantity} ${activeExpiring.unit} in ${activeExpiring.storageLocation} is actively monitored in real time.`
+        : 'Real-time expiry notifications and desktop push alerts are active and working.',
+      severity: 'urgent',
+      expiresAt: activeExpiring?.expiresAt ?? getLocalDateString(),
+      isStock: false,
+    };
+
+    setLiveToasts((prev) => [previewAlert, ...prev].slice(0, 6));
+    if (soundEnabled) {
+      playAlertChime('urgent');
+    }
+    if (profile?.browserPushEnabled) {
+      dispatchBrowserNotification(
+        previewAlert.title,
+        previewAlert.message,
+        `freshledger-test-${Date.now()}`
+      );
+    }
+  };
 
   const handleSignIn = async () => {
     setAuthError(null);
@@ -482,6 +589,7 @@ function WorkspaceApp() {
               {profile?.email || user.email || ''}
             </div>
           </div>
+          <PWAInstallButton variant="sidebar" />
           <button
             type="button"
             onClick={handleSignOut}
@@ -541,6 +649,7 @@ function WorkspaceApp() {
 
         {/* Main Viewport */}
         <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
+          <OfflineIndicator hasPendingSync={hasPendingSync} />
           {alertBanner && (
             <div
               role="status"
@@ -578,6 +687,7 @@ function WorkspaceApp() {
               wasteLogs={wasteLogs}
               loading={dataLoading}
               currencyCode={currencyCode}
+              nowMs={nowMs}
               onAddItem={() => {
                 setEditingItem(null);
                 setItemModalOpen(true);
@@ -598,10 +708,15 @@ function WorkspaceApp() {
               notifications={notifications}
               items={items}
               browserPushEnabled={profile?.browserPushEnabled ?? false}
+              soundEnabled={soundEnabled}
+              nowMs={nowMs}
               lastScanAt={lastScanAt}
               scanning={scanning}
               onRunScan={() => runExpiryScan(true)}
               onEnableBrowserPush={handleEnableBrowserPush}
+              onToggleSound={handleToggleSound}
+              onTriggerTestAlert={handleTriggerTestAlert}
+              onPopulateSample={() => populateSamplePantry(user.uid)}
               onMarkRead={(n) =>
                 updateNotificationState(user.uid, n.id, { read: true, dismissed: n.dismissed })
               }
@@ -657,6 +772,18 @@ function WorkspaceApp() {
         currencyCode={currencyCode}
         onClose={() => setWasteTargetItem(null)}
         onConfirmWaste={handleConfirmWaste}
+      />
+
+      <LiveAlertToasts
+        toasts={liveToasts}
+        itemsById={itemsById}
+        nowMs={nowMs}
+        onDismissToast={(id) => setLiveToasts((prev) => prev.filter((t) => t.id !== id))}
+        onOpenInbox={() => setSection('notifications')}
+        onConsumeItem={async (item, toastId) => {
+          await handleConsumeItem(item);
+          setLiveToasts((prev) => prev.filter((t) => t.id !== toastId));
+        }}
       />
     </div>
   );

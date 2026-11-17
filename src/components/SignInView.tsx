@@ -18,7 +18,9 @@ import {
   Layers,
   Leaf,
   Sprout,
+  WifiOff,
 } from 'lucide-react';
+import { PWAInstallButton, useOnlineStatus } from './PWAControls';
 
 interface SignInViewProps {
   onSignIn: () => Promise<void>;
@@ -109,6 +111,7 @@ export const SignInView: React.FC<SignInViewProps> = ({ onSignIn, authError }) =
   const [activeStageIndex, setActiveStageIndex] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
 
+  const isOnline = useOnlineStatus();
   const shouldReduceMotion = useReducedMotion();
   const showcaseRef = useRef<HTMLDivElement | null>(null);
 
@@ -196,7 +199,7 @@ export const SignInView: React.FC<SignInViewProps> = ({ onSignIn, authError }) =
             <button
               type="button"
               onClick={handleClick}
-              disabled={signingIn}
+              disabled={signingIn || !isOnline}
               className="px-4 py-2 text-xs font-medium text-white bg-[#14532d] rounded-lg hover:bg-[#166534] disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               {signingIn ? 'Signing in...' : 'Sign in with Google'}
@@ -247,7 +250,7 @@ export const SignInView: React.FC<SignInViewProps> = ({ onSignIn, authError }) =
                   <motion.button
                     type="button"
                     onClick={handleClick}
-                    disabled={signingIn}
+                    disabled={signingIn || !isOnline}
                     whileHover={{ y: -1 }}
                     whileTap={{ scale: 0.99 }}
                     transition={{ duration: 0.15, ease: EASE_OUT_EXPO }}
@@ -268,10 +271,20 @@ export const SignInView: React.FC<SignInViewProps> = ({ onSignIn, authError }) =
                     </span>
                     <ArrowRight className="w-4 h-4 transition-transform duration-150 group-hover:translate-x-0.5" />
                   </motion.button>
+                  <PWAInstallButton variant="hero" />
                   <span className="text-xs text-[#546b5d]">
-                    Private Firestore pantry · Real-time sync
+                    Private Firestore pantry · Offline cache ready
                   </span>
                 </motion.div>
+
+                {!isOnline && (
+                  <div className="mb-6 p-3.5 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-900 flex items-center gap-2.5">
+                    <WifiOff className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>
+                      You are currently offline. Connect once to sign in with Google; once signed in, FreshLedger works offline with automatic local sync.
+                    </span>
+                  </div>
+                )}
 
                 {authError && (
                   <div className="mb-8 p-3.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-800">

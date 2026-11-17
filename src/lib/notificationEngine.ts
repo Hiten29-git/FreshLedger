@@ -1,7 +1,7 @@
 import { collection, doc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { formatCurrency } from './currency';
 import { getDaysUntilExpiry, formatShortDate } from './dateUtils';
-import { db, handleFirestoreError, OperationType } from './firebase';
+import { db, executeOfflineSafeWrite, OperationType } from './firebase';
 import {
   FIELD_LIMITS,
   type ExpiryNotification,
@@ -10,10 +10,22 @@ import {
   type NotificationSeverity,
 } from '../types';
 
+export interface TriggeredAlertPreview {
+  id: string;
+  itemId: string;
+  itemName: string;
+  title: string;
+  message: string;
+  severity: NotificationSeverity;
+  expiresAt: string;
+  isStock: boolean;
+}
+
 export interface EvaluationResult {
   triggeredCount: number;
   browserSentCount: number;
   latestTitles: string[];
+  triggeredAlerts: TriggeredAlertPreview[];
 }
 
 function buildExpiryNotificationCopy(
@@ -71,15 +83,66 @@ export function canUseBrowserNotifications(): boolean {
 export function dispatchBrowserNotification(title: string, body: string, tag: string): boolean {
   if (!canUseBrowserNotifications()) return false;
   if (Notification.permission !== 'granted') return false;
+
   try {
     new Notification(title, {
       body,
       tag,
+      icon: '/pwa-192x192.png',
       requireInteraction: false,
     });
     return true;
   } catch {
+    if ('serviceWorker' in navigator) {
+      void navigator.serviceWorker.ready
+        .then((reg) =>
+          reg.showNotification(title, {
+            body,
+            tag,
+            icon: '/pwa-192x192.png',
+          })
+        )
+        .catch(() => {});
+      return true;
+    }
     return false;
+  }
+}
+
+export function playAlertChime(severity: NotificationSeverity): void {
+  if (typeof window === 'undefined') return;
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return;
+
+  try {
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    const notes =
+      severity === 'urgent' || severity === 'expired' ? [659.25, 880] : [523.25, 659.25];
+
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now + idx * 0.12);
+
+      gain.gain.setValueAtTime(0.001, now + idx * 0.12);
+      gain.gain.exponentialRampToValueAtTime(0.06, now + idx * 0.12 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + idx * 0.12 + 0.24);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + idx * 0.12);
+      osc.stop(now + idx * 0.12 + 0.26);
+    });
+
+    window.setTimeout(() => {
+      void ctx.close().catch(() => {});
+    }, 800);
+  } catch {
+    // Ignore autoplay blocks prior to user interaction
   }
 }
 
@@ -118,10 +181,14 @@ export async function evaluateAndDispatchNotifications(params: {
     .sort((a, b) => (a.minQuantity ?? 0) - (b.minQuantity ?? 0));
 
   if ((expiryRules.length === 0 && stockRules.length === 0) || items.length === 0) {
-    return { triggeredCount: 0, browserSentCount: 0, latestTitles: [] };
+    return {
+      triggeredCount: 0,
+      browserSentCount: 0,
+      latestTitles: [],
+      triggeredAlerts: [],
+    };
   }
 
-  // Deduplicate expiry notifications against existing records and item.notifiedTiers
   const existingKeys = new Set(
     existingNotifications.map((n) => `${n.itemId}::${n.tierKey}`)
   );
@@ -130,6 +197,7 @@ export async function evaluateAndDispatchNotifications(params: {
   let triggeredCount = 0;
   let browserSentCount = 0;
   const latestTitles: string[] = [];
+  const triggeredAlerts: TriggeredAlertPreview[] = [];
 
   for (const item of items) {
     if (item.status !== 'active') continue;
@@ -192,6 +260,16 @@ export async function evaluateAndDispatchNotifications(params: {
           existingKeys.add(`${item.id}::${matchingExpiryRule.tierKey}`);
           triggeredCount += 1;
           latestTitles.push(title);
+          triggeredAlerts.push({
+            id: notifRef.id,
+            itemId: item.id,
+            itemName: item.name,
+            title,
+            message,
+            severity: matchingExpiryRule.severity,
+            expiresAt: item.expiresAt,
+            isStock: false,
+          });
         }
       }
     }
@@ -250,6 +328,16 @@ export async function evaluateAndDispatchNotifications(params: {
 
         triggeredCount += 1;
         latestTitles.push(title);
+        triggeredAlerts.push({
+          id: notifRef.id,
+          itemId: item.id,
+          itemName: item.name,
+          title,
+          message,
+          severity: matchingStockRule.severity,
+          expiresAt: item.expiresAt,
+          isStock: true,
+        });
       }
     }
 
@@ -263,12 +351,12 @@ export async function evaluateAndDispatchNotifications(params: {
   }
 
   if (triggeredCount > 0) {
-    try {
-      await batch.commit();
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `users/${userId}/notifications`);
-    }
+    await executeOfflineSafeWrite(
+      batch.commit(),
+      OperationType.WRITE,
+      `users/${userId}/notifications`
+    );
   }
 
-  return { triggeredCount, browserSentCount, latestTitles };
+  return { triggeredCount, browserSentCount, latestTitles, triggeredAlerts };
 }

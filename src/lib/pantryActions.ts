@@ -4,7 +4,9 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromCache,
   getDocs,
+  getDocsFromCache,
   query,
   serverTimestamp,
   setDoc,
@@ -14,7 +16,13 @@ import {
 } from 'firebase/firestore';
 import { detectDefaultCurrencyCode } from './currency';
 import { getLocalDateString } from './dateUtils';
-import { db, handleFirestoreError, OperationType } from './firebase';
+import {
+  db,
+  executeOfflineSafeWrite,
+  handleFirestoreError,
+  isClientOnline,
+  OperationType,
+} from './firebase';
 import { buildSamplePantrySeeds, DEFAULT_NOTIFICATION_RULES } from './sampleData';
 import {
   FIELD_LIMITS,
@@ -31,31 +39,62 @@ import {
 export async function ensureUserAndDefaults(user: User): Promise<void> {
   const userPath = `users/${user.uid}`;
   const userRef = doc(db, 'users', user.uid);
+  const online = isClientOnline();
+
   try {
-    const snap = await getDoc(userRef);
-    if (!snap.exists()) {
+    let userExists = false;
+    if (online) {
+      const snap = await getDoc(userRef);
+      userExists = snap.exists();
+    } else {
+      try {
+        const cachedSnap = await getDocFromCache(userRef);
+        userExists = cachedSnap.exists();
+      } catch {
+        // Not yet in IndexedDB cache while offline; allow cached listeners to mount
+        return;
+      }
+    }
+
+    if (!userExists) {
       const displayName = (
         user.displayName?.trim() ||
         user.email?.split('@')[0] ||
         'Kitchen Manager'
       ).slice(0, 100);
-      await setDoc(userRef, {
-        userId: user.uid,
-        displayName,
-        email: (user.email || '').slice(0, 200),
-        browserPushEnabled: false,
-        dailyCheckHour: 9,
-        currencyCode: detectDefaultCurrencyCode(),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      await executeOfflineSafeWrite(
+        setDoc(userRef, {
+          userId: user.uid,
+          displayName,
+          email: (user.email || '').slice(0, 200),
+          browserPushEnabled: false,
+          dailyCheckHour: 9,
+          currencyCode: detectDefaultCurrencyCode(),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        }),
+        OperationType.WRITE,
+        userPath
+      );
     }
 
     const rulesPath = `users/${user.uid}/rules`;
-    const rulesSnap = await getDocs(
-      query(collection(db, rulesPath), where('ownerId', '==', user.uid))
-    );
-    if (rulesSnap.empty) {
+    const rulesQuery = query(collection(db, rulesPath), where('ownerId', '==', user.uid));
+    let rulesEmpty = false;
+
+    if (online) {
+      const rulesSnap = await getDocs(rulesQuery);
+      rulesEmpty = rulesSnap.empty;
+    } else {
+      try {
+        const cachedRules = await getDocsFromCache(rulesQuery);
+        rulesEmpty = cachedRules.empty;
+      } catch {
+        rulesEmpty = false;
+      }
+    }
+
+    if (rulesEmpty) {
       const batch = writeBatch(db);
       for (const rule of DEFAULT_NOTIFICATION_RULES) {
         const ruleRef = doc(db, rulesPath, rule.id);
@@ -79,9 +118,13 @@ export async function ensureUserAndDefaults(user: User): Promise<void> {
         }
         batch.set(ruleRef, payload);
       }
-      await batch.commit();
+      await executeOfflineSafeWrite(batch.commit(), OperationType.WRITE, rulesPath);
     }
   } catch (error) {
+    if (!isClientOnline()) {
+      console.warn('Offline account bootstrap fallback active:', error);
+      return;
+    }
     handleFirestoreError(error, OperationType.WRITE, userPath);
   }
 }
@@ -100,9 +143,9 @@ export interface FoodItemInput {
 
 export async function addFoodItem(userId: string, input: FoodItemInput): Promise<string> {
   const path = `users/${userId}/items`;
-  try {
-    const ref = doc(collection(db, path));
-    await setDoc(ref, {
+  const ref = doc(collection(db, path));
+  await executeOfflineSafeWrite(
+    setDoc(ref, {
       ownerId: userId,
       name: input.name.trim().slice(0, FIELD_LIMITS.NAME_MAX),
       category: input.category,
@@ -117,11 +160,11 @@ export async function addFoodItem(userId: string, input: FoodItemInput): Promise
       notes: input.notes.trim().slice(0, FIELD_LIMITS.NOTES_MAX),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-    });
-    return ref.id;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, path);
-  }
+    }),
+    OperationType.CREATE,
+    path
+  );
+  return ref.id;
 }
 
 export async function updateFoodItem(
@@ -132,8 +175,8 @@ export async function updateFoodItem(
   existingTiers: string[]
 ): Promise<void> {
   const path = `users/${userId}/items/${itemId}`;
-  try {
-    await updateDoc(doc(db, path), {
+  await executeOfflineSafeWrite(
+    updateDoc(doc(db, path), {
       name: input.name.trim().slice(0, FIELD_LIMITS.NAME_MAX),
       category: input.category,
       storageLocation: input.storageLocation,
@@ -142,22 +185,20 @@ export async function updateFoodItem(
       estimatedCost: Math.max(0, Math.min(FIELD_LIMITS.COST_MAX, Number(input.estimatedCost) || 0)),
       purchasedAt: input.purchasedAt,
       expiresAt: input.expiresAt,
-      notifiedTiers: resetNotificationsIfDateChanged ? [] : existingTiers.slice(0, FIELD_LIMITS.MAX_NOTIFIED_TIERS),
+      notifiedTiers: resetNotificationsIfDateChanged
+        ? []
+        : existingTiers.slice(0, FIELD_LIMITS.MAX_NOTIFIED_TIERS),
       notes: input.notes.trim().slice(0, FIELD_LIMITS.NOTES_MAX),
       updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
-  }
+    }),
+    OperationType.UPDATE,
+    path
+  );
 }
 
 export async function deleteFoodItem(userId: string, itemId: string): Promise<void> {
   const path = `users/${userId}/items/${itemId}`;
-  try {
-    await deleteDoc(doc(db, path));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, path);
-  }
+  await executeOfflineSafeWrite(deleteDoc(doc(db, path)), OperationType.DELETE, path);
 }
 
 export async function resolveFoodItemOutcome(params: {
@@ -203,11 +244,7 @@ export async function resolveFoodItemOutcome(params: {
     }
   }
 
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, itemPath);
-  }
+  await executeOfflineSafeWrite(batch.commit(), OperationType.WRITE, itemPath);
 }
 
 export async function populateSamplePantry(userId: string): Promise<void> {
@@ -235,11 +272,7 @@ export async function populateSamplePantry(userId: string): Promise<void> {
     });
   }
 
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await executeOfflineSafeWrite(batch.commit(), OperationType.WRITE, path);
 }
 
 export async function updateNotificationState(
@@ -248,15 +281,15 @@ export async function updateNotificationState(
   updates: { read: boolean; dismissed: boolean }
 ): Promise<void> {
   const path = `users/${userId}/notifications/${notificationId}`;
-  try {
-    await updateDoc(doc(db, path), {
+  await executeOfflineSafeWrite(
+    updateDoc(doc(db, path), {
       read: updates.read,
       dismissed: updates.dismissed,
       updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
-  }
+    }),
+    OperationType.UPDATE,
+    path
+  );
 }
 
 export async function markAllNotificationsRead(
@@ -275,11 +308,7 @@ export async function markAllNotificationsRead(
       updatedAt: serverTimestamp(),
     });
   }
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
-  }
+  await executeOfflineSafeWrite(batch.commit(), OperationType.WRITE, path);
 }
 
 export interface RuleInput {
@@ -330,12 +359,8 @@ export async function createNotificationRule(userId: string, input: RuleInput): 
     payload.targetCategory = input.targetCategory ?? 'ALL';
   }
 
-  try {
-    const ref = doc(collection(db, path));
-    await setDoc(ref, payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, path);
-  }
+  const ref = doc(collection(db, path));
+  await executeOfflineSafeWrite(setDoc(ref, payload), OperationType.CREATE, path);
 }
 
 export async function updateNotificationRule(
@@ -367,20 +392,12 @@ export async function updateNotificationRule(
     payload.targetCategory = input.targetCategory ?? 'ALL';
   }
 
-  try {
-    await updateDoc(doc(db, path), payload);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
-  }
+  await executeOfflineSafeWrite(updateDoc(doc(db, path), payload), OperationType.UPDATE, path);
 }
 
 export async function deleteNotificationRule(userId: string, ruleId: string): Promise<void> {
   const path = `users/${userId}/rules/${ruleId}`;
-  try {
-    await deleteDoc(doc(db, path));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, path);
-  }
+  await executeOfflineSafeWrite(deleteDoc(doc(db, path)), OperationType.DELETE, path);
 }
 
 export async function updateUserNotificationPrefs(
@@ -388,15 +405,15 @@ export async function updateUserNotificationPrefs(
   prefs: { browserPushEnabled: boolean; dailyCheckHour: number }
 ): Promise<void> {
   const path = `users/${userId}`;
-  try {
-    await updateDoc(doc(db, path), {
+  await executeOfflineSafeWrite(
+    updateDoc(doc(db, path), {
       browserPushEnabled: prefs.browserPushEnabled,
       dailyCheckHour: Math.max(0, Math.min(23, Math.round(prefs.dailyCheckHour))),
       updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
-  }
+    }),
+    OperationType.UPDATE,
+    path
+  );
 }
 
 export async function updateUserCurrency(
@@ -405,21 +422,17 @@ export async function updateUserCurrency(
 ): Promise<void> {
   const safeCode = /^[A-Z]{3}$/.test(currencyCode) ? currencyCode : 'USD';
   const path = `users/${userId}`;
-  try {
-    await updateDoc(doc(db, path), {
+  await executeOfflineSafeWrite(
+    updateDoc(doc(db, path), {
       currencyCode: safeCode,
       updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
-  }
+    }),
+    OperationType.UPDATE,
+    path
+  );
 }
 
 export async function deleteWasteLog(userId: string, logId: string): Promise<void> {
   const path = `users/${userId}/wasteLogs/${logId}`;
-  try {
-    await deleteDoc(doc(db, path));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, path);
-  }
+  await executeOfflineSafeWrite(deleteDoc(doc(db, path)), OperationType.DELETE, path);
 }

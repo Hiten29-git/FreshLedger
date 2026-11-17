@@ -8,9 +8,12 @@ import {
   Clock,
   Info,
   RefreshCw,
+  Sparkles,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
-import { formatShortDate } from '../lib/dateUtils';
-import { canUseBrowserNotifications, dispatchBrowserNotification } from '../lib/notificationEngine';
+import { formatShortDate, getLiveExpiryCountdown } from '../lib/dateUtils';
+import { canUseBrowserNotifications } from '../lib/notificationEngine';
 import type { ExpiryNotification, FoodItem, NotificationSeverity } from '../types';
 
 type NotifFilter = 'inbox' | 'unread' | 'dismissed';
@@ -19,10 +22,15 @@ interface NotificationsViewProps {
   notifications: ExpiryNotification[];
   items: FoodItem[];
   browserPushEnabled: boolean;
+  soundEnabled: boolean;
+  nowMs?: number;
   lastScanAt: Date | null;
   scanning: boolean;
   onRunScan: () => Promise<void>;
   onEnableBrowserPush: () => Promise<void>;
+  onToggleSound: () => void;
+  onTriggerTestAlert: () => void;
+  onPopulateSample: () => Promise<void>;
   onMarkRead: (notif: ExpiryNotification) => Promise<void>;
   onDismiss: (notif: ExpiryNotification) => Promise<void>;
   onMarkAllRead: () => Promise<void>;
@@ -67,10 +75,15 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
   notifications,
   items,
   browserPushEnabled,
+  soundEnabled,
+  nowMs = Date.now(),
   lastScanAt,
   scanning,
   onRunScan,
   onEnableBrowserPush,
+  onToggleSound,
+  onTriggerTestAlert,
+  onPopulateSample,
   onMarkRead,
   onDismiss,
   onMarkAllRead,
@@ -80,6 +93,7 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
   const [filter, setFilter] = useState<NotifFilter>('inbox');
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [seeding, setSeeding] = useState(false);
 
   const browserSupported = canUseBrowserNotifications();
   const browserPermission = browserSupported ? Notification.permission : 'denied';
@@ -111,16 +125,12 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
     [notifications]
   );
 
-  const handleTestBrowserPush = () => {
-    const sent = dispatchBrowserNotification(
-      'FreshLedger Expiry Alert Test',
-      'Automated pre-expiration desktop notifications are active and working.',
-      'freshledger-test'
-    );
+  const handleTestLiveAlert = () => {
+    onTriggerTestAlert();
     setTestMessage(
-      sent
-        ? 'Test desktop notification dispatched.'
-        : 'Browser blocked the notification. Check site notification permissions.'
+      browserSupported && browserPermission === 'granted' && browserPushEnabled
+        ? 'Live popup alert and desktop push notification dispatched.'
+        : 'Live in-app alert toast dispatched. Enable browser alerts for OS desktop notifications too.'
     );
   };
 
@@ -133,9 +143,18 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
     }
   };
 
+  const handleSeedFromInbox = async () => {
+    setSeeding(true);
+    try {
+      await onPopulateSample();
+    } finally {
+      setSeeding(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
-      {/* Desktop Push & Automation Bar */}
+      {/* Real-Time Dispatch & Sound Controls */}
       <section className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div className="space-y-1">
           <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
@@ -144,16 +163,16 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
             ) : (
               <BellOff className="w-4 h-4 text-slate-500 shrink-0" />
             )}
-            <span>Automated Pre-Expiration Dispatch</span>
+            <span>Real-Time Expiry &amp; Stock Alert Monitor</span>
           </div>
           <p className="text-xs text-slate-600">
             {browserSupported
               ? browserPermission === 'granted' && browserPushEnabled
-                ? 'Browser desktop alerts and in-app inbox notifications are enabled.'
+                ? 'Live in-app toast alerts, browser desktop push, and 10-second background checks are active.'
                 : browserPermission === 'denied'
-                  ? 'Browser notifications are blocked in site settings; alerts still arrive in your in-app inbox.'
-                  : 'Enable browser notifications to receive desktop alerts before items expire.'
-              : 'Browser notification API is unavailable in this frame; alerts are logged to your in-app inbox.'}
+                  ? 'Browser notifications are blocked in site settings; live in-app toasts and inbox alerts remain active.'
+                  : 'Live in-app alerts are active. Enable browser notifications for OS desktop alerts even when minimized.'
+              : 'Live in-app toast alerts and inbox monitoring are active.'}
             {lastScanAt && (
               <span className="font-mono tabular-nums text-slate-500">
                 {' '}· Last scan {lastScanAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
@@ -164,6 +183,20 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          <button
+            type="button"
+            onClick={onToggleSound}
+            aria-pressed={soundEnabled}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            {soundEnabled ? (
+              <Volume2 className="w-3.5 h-3.5 text-emerald-700" />
+            ) : (
+              <VolumeX className="w-3.5 h-3.5 text-slate-400" />
+            )}
+            <span>{soundEnabled ? 'Sound On' : 'Muted'}</span>
+          </button>
+
           {browserSupported && (browserPermission !== 'granted' || !browserPushEnabled) && (
             <button
               type="button"
@@ -173,15 +206,15 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
               Enable Browser Alerts
             </button>
           )}
-          {browserSupported && browserPermission === 'granted' && browserPushEnabled && (
-            <button
-              type="button"
-              onClick={handleTestBrowserPush}
-              className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              Test Desktop Alert
-            </button>
-          )}
+
+          <button
+            type="button"
+            onClick={handleTestLiveAlert}
+            className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Test Live Alert
+          </button>
+
           <button
             type="button"
             onClick={onRunScan}
@@ -189,7 +222,7 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
-            <span>{scanning ? 'Scanning...' : 'Run Expiry Scan'}</span>
+            <span>{scanning ? 'Scanning...' : 'Run Scan Now'}</span>
           </button>
         </div>
       </section>
@@ -241,9 +274,20 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
                   ? 'No dismissed alerts'
                   : 'No automated alerts triggered yet'}
             </h3>
-            <p className="text-sm text-slate-600">
-              When active inventory items cross a configured pre-expiration lead time or drop below a minimum stock threshold, alerts automatically appear here.
+            <p className="text-sm text-slate-600 mb-5">
+              When active inventory items cross a configured pre-expiration lead time or drop below a minimum stock threshold, alerts trigger immediately in real time.
             </p>
+            {items.length === 0 && filter === 'inbox' && (
+              <button
+                type="button"
+                onClick={handleSeedFromInbox}
+                disabled={seeding}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>{seeding ? 'Loading Sample...' : 'Load Sample Pantry & Trigger Alerts'}</span>
+              </button>
+            )}
           </div>
         ) : (
           <div className="divide-y divide-slate-200">
@@ -252,6 +296,7 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
               const isActiveItem = linkedItem && linkedItem.status === 'active';
               const isBusy = busyId === notif.id;
               const isStockAlert = notif.tierKey.startsWith('stock_');
+              const liveCountdown = getLiveExpiryCountdown(notif.expiresAt, nowMs);
 
               return (
                 <div
@@ -271,6 +316,20 @@ export const NotificationsView: React.FC<NotificationsViewProps> = ({
                       <span className="font-mono tabular-nums text-slate-600">
                         Expires {formatShortDate(notif.expiresAt)}
                       </span>
+                      {!isStockAlert && (
+                        <>
+                          <span className="text-slate-300" aria-hidden="true">·</span>
+                          <span
+                            className={`font-mono tabular-nums ${
+                              liveCountdown.isExpired || liveCountdown.isToday
+                                ? 'text-red-700 font-medium'
+                                : 'text-slate-600'
+                            }`}
+                          >
+                            {liveCountdown.formatted}
+                          </span>
+                        </>
+                      )}
                       <span className="text-slate-300" aria-hidden="true">·</span>
                       <span className="text-slate-500">
                         {notif.deliveredBrowser ? 'In-App & Browser Push' : 'In-App Inbox'}
