@@ -1,0 +1,6 @@
+{
+  "name": "FreshLedger",
+  "description": "Food expiry and waste tracking system with automated pre-expiration alerts, inventory ledger, and waste analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

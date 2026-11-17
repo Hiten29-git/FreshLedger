@@ -1,0 +1,232 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny everything unless explicitly permitted below.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isValidDateStr(s) {
+      return s is string && s.size() == 10 && s.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidCategory(c) {
+      return c in ['Produce', 'Dairy', 'Meat & Seafood', 'Bakery', 'Pantry', 'Frozen', 'Beverages', 'Prepared'];
+    }
+
+    function isValidLocation(loc) {
+      return loc in ['Refrigerator', 'Freezer', 'Pantry', 'Counter'];
+    }
+
+    function isValidUnit(u) {
+      return u in ['pcs', 'kg', 'g', 'L', 'ml', 'packs', 'oz', 'lbs'];
+    }
+
+    function isValidSeverity(s) {
+      return s in ['info', 'warning', 'urgent', 'expired'];
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['userId', 'displayName', 'email', 'browserPushEnabled', 'dailyCheckHour', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'displayName', 'email', 'browserPushEnabled', 'dailyCheckHour', 'currencyCode', 'createdAt', 'updatedAt'])
+        && data.userId is string && isValidId(data.userId) && data.userId == userId && data.userId == request.auth.uid
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100
+        && data.email is string && data.email.size() <= 200
+        && data.browserPushEnabled is bool
+        && data.dailyCheckHour is int && data.dailyCheckHour >= 0 && data.dailyCheckHour <= 23
+        && (!('currencyCode' in data) || (data.currencyCode is string && data.currencyCode.size() == 3 && data.currencyCode.matches('^[A-Z]{3}$')))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFoodItem(data, userId) {
+      return data.keys().hasAll(['ownerId', 'name', 'category', 'storageLocation', 'quantity', 'unit', 'estimatedCost', 'purchasedAt', 'expiresAt', 'status', 'notifiedTiers', 'notes', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'name', 'category', 'storageLocation', 'quantity', 'unit', 'estimatedCost', 'purchasedAt', 'expiresAt', 'status', 'notifiedTiers', 'notes', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.category is string && data.category.size() <= 40 && isValidCategory(data.category)
+        && data.storageLocation is string && data.storageLocation.size() <= 30 && isValidLocation(data.storageLocation)
+        && (data.quantity is int || data.quantity is float) && data.quantity > 0 && data.quantity <= 100000
+        && data.unit is string && data.unit.size() <= 16 && isValidUnit(data.unit)
+        && (data.estimatedCost is int || data.estimatedCost is float) && data.estimatedCost >= 0 && data.estimatedCost <= 100000
+        && isValidDateStr(data.purchasedAt)
+        && isValidDateStr(data.expiresAt)
+        && data.status is string && data.status.size() <= 16 && data.status in ['active', 'consumed', 'wasted']
+        && data.notifiedTiers is list && data.notifiedTiers.size() <= 10
+        && (data.notifiedTiers.size() == 0 || (data.notifiedTiers[0] is string && data.notifiedTiers[0].size() <= 32))
+        && data.notes is string && data.notes.size() <= 500
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidNotificationRule(data, userId) {
+      return data.keys().hasAll(['ownerId', 'label', 'tierKey', 'daysBefore', 'enabled', 'channelBrowser', 'channelInApp', 'severity', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'label', 'tierKey', 'daysBefore', 'ruleType', 'minQuantity', 'targetUnit', 'targetCategory', 'enabled', 'channelBrowser', 'channelInApp', 'severity', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 80
+        && data.tierKey is string && data.tierKey.size() >= 1 && data.tierKey.size() <= 32 && data.tierKey.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.daysBefore is int && data.daysBefore >= -7 && data.daysBefore <= 90
+        && (!('ruleType' in data) || (data.ruleType is string && data.ruleType.size() <= 16 && data.ruleType in ['expiry', 'stock']))
+        && (!('minQuantity' in data) || ((data.minQuantity is int || data.minQuantity is float) && data.minQuantity > 0 && data.minQuantity <= 100000))
+        && (!('targetUnit' in data) || (data.targetUnit is string && data.targetUnit.size() <= 16 && (data.targetUnit == 'ANY' || isValidUnit(data.targetUnit))))
+        && (!('targetCategory' in data) || (data.targetCategory is string && data.targetCategory.size() <= 40 && (data.targetCategory == 'ALL' || isValidCategory(data.targetCategory))))
+        && data.enabled is bool
+        && data.channelBrowser is bool
+        && data.channelInApp is bool
+        && data.severity is string && data.severity.size() <= 16 && isValidSeverity(data.severity)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidExpiryNotification(data, userId) {
+      return data.keys().hasAll(['ownerId', 'itemId', 'itemName', 'tierKey', 'severity', 'title', 'message', 'expiresAt', 'daysRemaining', 'read', 'dismissed', 'deliveredBrowser', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['ownerId', 'itemId', 'itemName', 'tierKey', 'severity', 'title', 'message', 'expiresAt', 'daysRemaining', 'read', 'dismissed', 'deliveredBrowser', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.itemId is string && isValidId(data.itemId)
+        && data.itemName is string && data.itemName.size() >= 1 && data.itemName.size() <= 120
+        && data.tierKey is string && data.tierKey.size() >= 1 && data.tierKey.size() <= 32 && data.tierKey.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.severity is string && data.severity.size() <= 16 && isValidSeverity(data.severity)
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 400
+        && isValidDateStr(data.expiresAt)
+        && data.daysRemaining is int && data.daysRemaining >= -365 && data.daysRemaining <= 365
+        && data.read is bool
+        && data.dismissed is bool
+        && data.deliveredBrowser is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWasteLog(data, userId) {
+      return data.keys().hasAll(['ownerId', 'itemId', 'itemName', 'category', 'outcome', 'quantity', 'unit', 'estimatedValue', 'reason', 'loggedDate', 'notes', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'itemId', 'itemName', 'category', 'outcome', 'quantity', 'unit', 'estimatedValue', 'reason', 'loggedDate', 'notes', 'createdAt'])
+        && data.ownerId is string && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.itemId is string && isValidId(data.itemId)
+        && data.itemName is string && data.itemName.size() >= 1 && data.itemName.size() <= 120
+        && data.category is string && data.category.size() <= 40 && isValidCategory(data.category)
+        && data.outcome is string && data.outcome.size() <= 16 && data.outcome in ['consumed', 'wasted']
+        && (data.quantity is int || data.quantity is float) && data.quantity > 0 && data.quantity <= 100000
+        && data.unit is string && data.unit.size() <= 16 && isValidUnit(data.unit)
+        && (data.estimatedValue is int || data.estimatedValue is float) && data.estimatedValue >= 0 && data.estimatedValue <= 100000
+        && data.reason is string && data.reason.size() <= 32 && data.reason in ['Used in Time', 'Expired', 'Spoiled Early', 'Over-purchased', 'Leftovers', 'Other']
+        && isValidDateStr(data.loggedDate)
+        && data.notes is string && data.notes.size() <= 300
+        && data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow create: if isValidId(userId) && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'browserPushEnabled', 'dailyCheckHour', 'currencyCode', 'updatedAt']);
+
+      match /items/{itemId} {
+        allow get: if isValidId(userId) && isValidId(itemId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(itemId) && isOwner(userId)
+          && isValidFoodItem(incoming(), userId)
+          && incoming().status == 'active'
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (exists(/databases/$(database)/documents/users/$(userId)) || existsAfter(/databases/$(database)/documents/users/$(userId)));
+        allow update: if isValidId(userId) && isValidId(itemId) && isOwner(userId)
+          && isValidFoodItem(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && existing().status == 'active'
+          && (
+            (incoming().status == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'category', 'storageLocation', 'quantity', 'unit', 'estimatedCost', 'purchasedAt', 'expiresAt', 'notifiedTiers', 'notes', 'updatedAt']))
+            || (incoming().status == 'active' && incoming().diff(existing()).affectedKeys().hasOnly(['notifiedTiers', 'updatedAt']))
+            || (incoming().status in ['consumed', 'wasted'] && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+          );
+        allow delete: if isValidId(userId) && isValidId(itemId) && isOwner(userId);
+      }
+
+      match /rules/{ruleId} {
+        allow get: if isValidId(userId) && isValidId(ruleId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(ruleId) && isOwner(userId)
+          && isValidNotificationRule(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (exists(/databases/$(database)/documents/users/$(userId)) || existsAfter(/databases/$(database)/documents/users/$(userId)));
+        allow update: if isValidId(userId) && isValidId(ruleId) && isOwner(userId)
+          && isValidNotificationRule(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().tierKey == existing().tierKey
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['label', 'daysBefore', 'ruleType', 'minQuantity', 'targetUnit', 'targetCategory', 'enabled', 'channelBrowser', 'channelInApp', 'severity', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(ruleId) && isOwner(userId);
+      }
+
+      match /notifications/{notificationId} {
+        allow get: if isValidId(userId) && isValidId(notificationId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(notificationId) && isOwner(userId)
+          && isValidExpiryNotification(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && (exists(/databases/$(database)/documents/users/$(userId)/items/$(incoming().itemId)) || existsAfter(/databases/$(database)/documents/users/$(userId)/items/$(incoming().itemId)));
+        allow update: if isValidId(userId) && isValidId(notificationId) && isOwner(userId)
+          && isValidExpiryNotification(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().itemId == existing().itemId
+          && incoming().tierKey == existing().tierKey
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['read', 'dismissed', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['deliveredBrowser', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(notificationId) && isOwner(userId);
+      }
+
+      match /wasteLogs/{logId} {
+        allow get: if isValidId(userId) && isValidId(logId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(logId) && isOwner(userId)
+          && isValidWasteLog(incoming(), userId)
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && exists(/databases/$(database)/documents/users/$(userId)/items/$(incoming().itemId));
+        allow delete: if isValidId(userId) && isValidId(logId) && isOwner(userId);
+      }
+    }
+  }
+}
